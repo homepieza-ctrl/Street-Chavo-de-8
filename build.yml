@@ -1,0 +1,627 @@
+name: Build APK
+# TODO EN UN SOLO ARCHIVO (incluye icono). Si falla, el motivo sale en rojo en la pagina del build.
+# Solo necesitas: este archivo en .github/workflows/build.yml  +  tu ROM (.sfc/.smc) en la raiz del repo.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Generar proyecto Android
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          trap 'echo "::error title=Fallo al generar el proyecto::Comando que fallo: $BASH_COMMAND"' ERR
+          mkdir -p /tmp/proj && cd /tmp/proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
+          }
+          rootProject.name = "StreetChaves2"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.streetchaves.game"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.streetchaves.game"
+                  minSdk = 23
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+                  freeCompilerArgs += "-Xskip-metadata-version-check"
+              }
+          }
+
+          dependencies {
+              implementation("com.github.Swordfish90:LibretroDroid:0.9.0")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Street Chaves 2"
+                  android:icon="@mipmap/ic_launcher"
+                  android:extractNativeLibs="true"
+                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/streetchaves/game
+          cat > app/src/main/java/com/streetchaves/game/MainActivity.kt <<'EOF'
+          package com.streetchaves.game
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import com.swordfish.libretrodroid.GLRetroView
+          import com.swordfish.libretrodroid.GLRetroViewData
+          import java.io.File
+          import kotlin.math.atan2
+          import kotlin.math.hypot
+          import kotlin.math.min
+
+          /** Palanca virtual de 8 direcciones: manda las flechas del D-pad al emulador. */
+          class StickView(context: Context, private val onKey: (Int, Boolean) -> Unit) : View(context) {
+
+              private val d = resources.displayMetrics.density
+              private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0x33FFFFFF
+                  style = Paint.Style.FILL
+              }
+              private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0x88FFFFFF.toInt()
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3f * d
+              }
+              private val knobPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0x99FFFFFF.toInt()
+                  style = Paint.Style.FILL
+              }
+
+              private var kx = 0f
+              private var ky = 0f
+              private var curX = 0
+              private var curY = 0
+              private val dxs = intArrayOf(1, 1, 0, -1, -1, -1, 0, 1)
+              private val dys = intArrayOf(0, 1, 1, 1, 0, -1, -1, -1)
+
+              override fun onDraw(canvas: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(width, height) / 2f - 2f * d
+                  canvas.drawCircle(cx, cy, r, basePaint)
+                  canvas.drawCircle(cx, cy, r, ringPaint)
+                  canvas.drawCircle(cx + kx, cy + ky, r * 0.36f, knobPaint)
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> update(e.x, e.y)
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          kx = 0f
+                          ky = 0f
+                          setDir(0, 0)
+                          invalidate()
+                      }
+                  }
+                  return true
+              }
+
+              private fun update(x: Float, y: Float) {
+                  val r = min(width, height) / 2f
+                  var vx = x - width / 2f
+                  var vy = y - height / 2f
+                  val dist = hypot(vx, vy)
+                  val maxD = r * 0.6f
+                  if (dist > maxD) {
+                      vx = vx / dist * maxD
+                      vy = vy / dist * maxD
+                  }
+                  kx = vx
+                  ky = vy
+                  if (dist < r * 0.2f) {
+                      setDir(0, 0)
+                  } else {
+                      val a = Math.toDegrees(atan2(vy.toDouble(), vx.toDouble()))
+                      val n = Math.round(a / 45.0).toInt()
+                      val s = ((n % 8) + 8) % 8
+                      setDir(dxs[s], dys[s])
+                  }
+                  invalidate()
+              }
+
+              private fun setDir(nx: Int, ny: Int) {
+                  if (nx != curX) {
+                      if (curX < 0) onKey(KeyEvent.KEYCODE_DPAD_LEFT, false)
+                      if (curX > 0) onKey(KeyEvent.KEYCODE_DPAD_RIGHT, false)
+                      if (nx < 0) onKey(KeyEvent.KEYCODE_DPAD_LEFT, true)
+                      if (nx > 0) onKey(KeyEvent.KEYCODE_DPAD_RIGHT, true)
+                      curX = nx
+                  }
+                  if (ny != curY) {
+                      if (curY < 0) onKey(KeyEvent.KEYCODE_DPAD_UP, false)
+                      if (curY > 0) onKey(KeyEvent.KEYCODE_DPAD_DOWN, false)
+                      if (ny < 0) onKey(KeyEvent.KEYCODE_DPAD_UP, true)
+                      if (ny > 0) onKey(KeyEvent.KEYCODE_DPAD_DOWN, true)
+                      curY = ny
+                  }
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var retroView: GLRetroView
+              private val d by lazy { resources.displayMetrics.density }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  WindowInsetsControllerCompat(window, window.decorView).apply {
+                      hide(WindowInsetsCompat.Type.systemBars())
+                      systemBarsBehavior =
+                          WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+
+                  // Copiar la ROM de assets a un archivo real
+                  val romName = assets.list("")?.firstOrNull { it.endsWith(".sfc") || it.endsWith(".smc") }
+                      ?: error("No hay ROM (.sfc/.smc) en assets")
+                  val rom = File(filesDir, romName)
+                  assets.open(romName).use { i -> rom.outputStream().use { o -> i.copyTo(o) } }
+
+                  val data = GLRetroViewData(this).apply {
+                      coreFilePath = applicationInfo.nativeLibraryDir + "/libsnes9x.so"
+                      gameFilePath = rom.absolutePath
+                      systemDirectory = File(filesDir, "system").apply { mkdirs() }.absolutePath
+                      savesDirectory = File(filesDir, "saves").apply { mkdirs() }.absolutePath
+                  }
+                  retroView = GLRetroView(this, data)
+                  lifecycle.addObserver(retroView)
+
+                  val root = FrameLayout(this)
+                  root.addView(
+                      retroView,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT
+                      )
+                  )
+                  setContentView(root)
+
+                  // Palanca (izquierda)
+                  val stick = StickView(this) { code, down ->
+                      retroView.sendKeyEvent(
+                          if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP,
+                          code
+                      )
+                  }
+                  val stickLp = FrameLayout.LayoutParams(
+                      (160 * d).toInt(), (160 * d).toInt(), Gravity.BOTTOM or Gravity.START
+                  )
+                  stickLp.setMargins((30 * d).toInt(), 0, 0, (25 * d).toInt())
+                  root.addView(stick, stickLp)
+
+                  // 6 botones (derecha): fila de arriba Y X L, fila de abajo B A R
+                  // Posicion fisica = layout Xbox de Android (B->BUTTON_A, A->BUTTON_B, Y->BUTTON_X, X->BUTTON_Y)
+                  val gr = Gravity.BOTTOM or Gravity.END
+                  val top = 100
+                  val bot = 25
+                  btn(root, "Y", KeyEvent.KEYCODE_BUTTON_X, gr, 0, 160, 0, top, 62, 62)
+                  btn(root, "X", KeyEvent.KEYCODE_BUTTON_Y, gr, 0, 90, 0, top, 62, 62)
+                  btn(root, "L", KeyEvent.KEYCODE_BUTTON_L1, gr, 0, 20, 0, top, 62, 62)
+                  btn(root, "B", KeyEvent.KEYCODE_BUTTON_A, gr, 0, 160, 0, bot, 62, 62)
+                  btn(root, "A", KeyEvent.KEYCODE_BUTTON_B, gr, 0, 90, 0, bot, 62, 62)
+                  btn(root, "R", KeyEvent.KEYCODE_BUTTON_R1, gr, 0, 20, 0, bot, 62, 62)
+
+                  // Select / Start
+                  val bc = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                  btn(root, "SELECT", KeyEvent.KEYCODE_BUTTON_SELECT, bc, 0, 0, 0, 15, 80, 36).translationX = -50 * d
+                  btn(root, "START", KeyEvent.KEYCODE_BUTTON_START, bc, 0, 0, 0, 15, 80, 36).translationX = 50 * d
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun btn(
+                  root: FrameLayout, label: String, keyCode: Int, gravity: Int,
+                  ml: Int, mr: Int, mt: Int, mb: Int, w: Int = 60, h: Int = 60
+              ): TextView {
+                  val tv = TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      textSize = if (label.length > 1) 11f else 18f
+                      this.gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = if (w == h) GradientDrawable.OVAL else GradientDrawable.RECTANGLE
+                          cornerRadius = 20 * d
+                          setColor(0x55FFFFFF)
+                          setStroke((2 * d).toInt(), 0x99FFFFFF.toInt())
+                      }
+                      alpha = 0.6f
+                      setOnTouchListener { v, e ->
+                          when (e.actionMasked) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  retroView.sendKeyEvent(KeyEvent.ACTION_DOWN, keyCode)
+                                  v.alpha = 1f
+                              }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                  retroView.sendKeyEvent(KeyEvent.ACTION_UP, keyCode)
+                                  v.alpha = 0.6f
+                              }
+                          }
+                          true
+                      }
+                  }
+                  val lp = FrameLayout.LayoutParams((w * d).toInt(), (h * d).toInt(), gravity)
+                  lp.setMargins((ml * d).toInt(), (mt * d).toInt(), (mr * d).toInt(), (mb * d).toInt())
+                  root.addView(tv, lp)
+                  return tv
+              }
+          }
+          EOF
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.jpg <<'EOF'
+          /9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUS
+          FBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQk
+          JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCADAAMADASIA
+          AhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQA
+          AAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3
+          ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWm
+          p6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEA
+          AwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSEx
+          BhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElK
+          U1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3
+          uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD0uiii
+          vxI+eCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA9C/4QzR/+eMn
+          /f1qP+EM0f8A54yf9/Wrcor9d/snBf8APqP3I9z2FP8AlRh/8IZo/wDzxk/7+tWNrnhi309hLAj+
+          QeDlidprtaZPCk8TRyKGRhgg1x47IcLXouFOCjLo0rf0iKmGhKLSVmebfYoP7p/Oj7FB/dP51pan
+          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
+          EOF
+          mkdir -p app/src/main/assets
+          ROM=$(find "$GITHUB_WORKSPACE" -maxdepth 1 \( -name '*.sfc' -o -name '*.smc' \) | head -n 1)
+          if [ -z "$ROM" ]; then echo "::error title=Falta la ROM::No hay ningun .sfc o .smc en la raiz del repo"; exit 1; fi
+          echo "ROM encontrada: $ROM"
+          cp "$ROM" "app/src/main/assets/game.${ROM##*.}"
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          curl -fL -o core.zip https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/snes9x_libretro_android.so.zip
+          unzip -o core.zip
+          mv snes9x_libretro_android.so app/src/main/jniLibs/arm64-v8a/libsnes9x.so
+          # --- Buscar la ultima version real de LibretroDroid ---
+          API=https://api.github.com/repos/Swordfish90/LibretroDroid
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" $API/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" $API/tags | grep -m1 '"name"' | sed -E 's/.*"name": *"([^"]+)".*/\1/')
+          fi
+          if [ -z "$TAG" ]; then echo "::error title=LibretroDroid::No pude averiguar la version"; exit 1; fi
+          echo "LibretroDroid version: $TAG"
+          sed -i "s/LibretroDroid:0.9.0/LibretroDroid:$TAG/" app/build.gradle.kts
+          grep LibretroDroid app/build.gradle.kts
+          # JitPack compila la libreria la primera vez que alguien la pide: esperar a que este lista
+          POM=https://jitpack.io/com/github/Swordfish90/LibretroDroid/$TAG/LibretroDroid-$TAG.pom
+          OK=0
+          for i in $(seq 1 24); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$POM" || true)
+            echo "JitPack intento $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then OK=1; break; fi
+            sleep 30
+          done
+          if [ $OK -ne 1 ]; then echo "::error title=JitPack no tiene la libreria::LibretroDroid $TAG no esta disponible en JitPack (HTTP $CODE). Log: https://jitpack.io/com/github/Swordfish90/LibretroDroid/$TAG/build.log"; exit 1; fi
+          ls -la app/src/main/jniLibs/arm64-v8a app/src/main/res/mipmap-xxxhdpi app/src/main/assets
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Compilar
+        working-directory: /tmp/proj
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon --stacktrace --console=plain > gradle.log 2>&1
+          CODE=$?
+          if [ $CODE -ne 0 ]; then
+            { grep -E '^e: ' gradle.log | head -n 6; awk '/What went wrong/{f=1} f{print; n++} n>=14{exit}' gradle.log; } > resumen.txt
+            if [ ! -s resumen.txt ]; then tail -n 15 gradle.log > resumen.txt; fi
+            MSG=$(sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g' resumen.txt)
+            echo "::error title=Fallo al compilar::$MSG"
+            tail -n 60 gradle.log
+            exit $CODE
+          fi
+          tail -n 5 gradle.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreetChaves2-apk
+          path: /tmp/proj/app/build/outputs/apk/debug/*.apk
